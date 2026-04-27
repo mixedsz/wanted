@@ -217,6 +217,7 @@ RegisterNetEvent('flake_wanted:client:setWanted', function(reason, duration, fir
     wantedTimer = duration * 60
 
     Config.Notify("You are now wanted by the police for: " .. reason, "error")
+    TriggerServerEvent('InteractSound_SV:PlayOnSource', Config.Sounds.wanted, 0.7)
 
     SendNUIMessage({
         type = "showmug",
@@ -260,6 +261,7 @@ end)
 
 -- Police clients see the wanted broadcast UI
 RegisterNetEvent('flake_wanted:client:showWantedBroadcast', function(firstName, lastName, reason, mugshot)
+    TriggerServerEvent('InteractSound_SV:PlayOnSource', Config.Sounds.wanted, 0.5)
     SendNUIMessage({
         type = "showmug",
         kind = "wanted",
@@ -279,6 +281,7 @@ end)
 -- ============================================================
 
 RegisterNetEvent('flake_wanted:client:showRaidUI', function(location, reason)
+    TriggerServerEvent('InteractSound_SV:PlayOnSource', Config.Sounds.raid, 0.5)
     SendNUIMessage({
         type = "showmug",
         kind = "raid",
@@ -304,6 +307,7 @@ RegisterNetEvent('flake_wanted:client:getJailMugshot', function(time, reason, of
 end)
 
 RegisterNetEvent('flake_wanted:client:showJailAnnouncement', function(firstName, lastName, time, reason, mugshot)
+    TriggerServerEvent('InteractSound_SV:PlayOnSource', Config.Sounds.jailed, 0.5)
     SendNUIMessage({
         type = "showmug",
         kind = "jailed",
