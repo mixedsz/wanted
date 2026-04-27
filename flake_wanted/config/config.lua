@@ -26,3 +26,12 @@ Config.Blip = {
 }
 
 Config.UseDatabase = true  -- false = won't save to database | true = will save to database
+
+-- Sound file names from InteractSound/client/html/sounds/
+-- Available files: bellring, cell, this_is_the_lspd, freeze_lspd,
+--   shoot_to_kill, give_yourself_up, cant_hide_boi, iphonetext, etc.
+Config.Sounds = {
+    wanted = 'bellring',         -- Played when a warrant is issued
+    jailed = 'cell',             -- Played during a jail announcement
+    raid   = 'this_is_the_lspd' -- Played when a raid starts
+}
