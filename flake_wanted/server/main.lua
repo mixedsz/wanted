@@ -1,9 +1,6 @@
--- Server-side script for the wanted system
 local QBCore, ESX = nil, nil
-local wantedPlayers = {}
-local raidedPlayers = {}
+local wantedPlayers = {} -- key: server player ID (int), value: { reason, officer, firstName, lastName, time }
 
--- Framework detection and initialization
 CreateThread(function()
     if GetResourceState(Config.QBCoreGetCoreObject) ~= 'missing' then
         QBCore = exports[Config.QBCoreGetCoreObject]:GetCoreObject()
@@ -12,561 +9,397 @@ CreateThread(function()
     end
 end)
 
--- Function to get player name based on framework
-local function GetPlayerName(source)
+-- Returns firstName, lastName for a connected player
+local function GetCharacterName(source)
     if QBCore then
         local Player = QBCore.Functions.GetPlayer(source)
-        if Player then
-            return Player.PlayerData.charinfo.firstname .. ' ' .. Player.PlayerData.charinfo.lastname
+        if Player and Player.PlayerData and Player.PlayerData.charinfo then
+            return Player.PlayerData.charinfo.firstname, Player.PlayerData.charinfo.lastname
         end
     elseif ESX then
         local xPlayer = ESX.GetPlayerFromId(source)
         if xPlayer then
-            return xPlayer.getName()
+            local full = xPlayer.getName() or ""
+            local parts = {}
+            for p in full:gmatch("%S+") do parts[#parts + 1] = p end
+            if #parts >= 2 then return parts[1], parts[2] end
+            return full, ""
         end
     end
-    return GetPlayerName(source) -- Fallback to native function
+    -- Fallback: split the native player name
+    local raw = GetPlayerName(source) or "Unknown"
+    local parts = {}
+    for p in raw:gmatch("%S+") do parts[#parts + 1] = p end
+    if #parts >= 2 then return parts[1], parts[2] end
+    return raw, "Player"
 end
 
--- Function to check if player has the required job
+local function GetFullName(source)
+    local f, l = GetCharacterName(source)
+    return (f or "") .. " " .. (l or "")
+end
+
 local function hasRequiredJob(source)
     if QBCore then
         local Player = QBCore.Functions.GetPlayer(source)
-        if Player and Config.JobLock[Player.PlayerData.job.name] then
-            return true
-        end
+        if Player and Config.JobLock[Player.PlayerData.job.name] then return true end
     elseif ESX then
         local xPlayer = ESX.GetPlayerFromId(source)
-        if xPlayer and Config.JobLock[xPlayer.getJob().name] then
-            return true
-        end
+        if xPlayer and Config.JobLock[xPlayer.getJob().name] then return true end
     end
     return false
 end
 
--- Initialize database if enabled
+local function ForEachPolice(cb)
+    for _, pid in ipairs(GetPlayers()) do
+        local playerId = tonumber(pid)
+        if hasRequiredJob(playerId) then cb(playerId) end
+    end
+end
+
+local function PlaySoundOn(targetId, sound, volume)
+    TriggerClientEvent('InteractSound_CL:PlayOnOne', targetId, sound, volume)
+end
+
+-- ============================================================
+-- DATABASE
+-- ============================================================
+
 CreateThread(function()
     if Config.UseDatabase then
         MySQL.query([[
             CREATE TABLE IF NOT EXISTS `wanted_records` (
-                `id` int(11) NOT NULL AUTO_INCREMENT,
-                `officer` varchar(50) DEFAULT NULL,
-                `target` varchar(50) DEFAULT NULL,
-                `reason` text DEFAULT NULL,
-                `action` varchar(50) DEFAULT NULL,
-                `timestamp` timestamp NOT NULL DEFAULT current_timestamp(),
+                `id`        int(11)      NOT NULL AUTO_INCREMENT,
+                `officer`   varchar(50)  DEFAULT NULL,
+                `target`    varchar(50)  DEFAULT NULL,
+                `reason`    text         DEFAULT NULL,
+                `action`    varchar(50)  DEFAULT NULL,
+                `timestamp` timestamp    NOT NULL DEFAULT current_timestamp(),
                 PRIMARY KEY (`id`)
             )
         ]])
     end
 end)
 
--- Function to save record to database
 local function SaveRecord(officer, target, reason, action)
     if Config.UseDatabase then
         MySQL.insert('INSERT INTO wanted_records (officer, target, reason, action) VALUES (?, ?, ?, ?)', {
             officer, target, reason, action
         })
     end
-
-    -- Log the action
     LogWantedAction(officer, target, reason, action)
 end
 
--- Event for setting a player as wanted
+-- ============================================================
+-- SERVER-SIDE POSITION BROADCAST
+-- Reads wanted players' ped coords directly on the server and
+-- pushes them to all online police every second.  This is the
+-- fallback for when the wanted player is outside the officer's
+-- streaming range; the client's own 100ms thread handles
+-- in-range live tracking without any server involvement.
+-- ============================================================
+
+CreateThread(function()
+    while true do
+        Wait(1000)
+        for targetId, data in pairs(wantedPlayers) do
+            if GetPlayerEndpoint(targetId) then
+                local ped = GetPlayerPed(targetId)
+                local coords = GetEntityCoords(ped)
+                ForEachPolice(function(pid)
+                    TriggerClientEvent('flake_wanted:client:updateWantedBlip', pid, targetId, coords, data.firstName, data.lastName)
+                end)
+            else
+                -- Player disconnected mid-warrant; clean up
+                wantedPlayers[targetId] = nil
+            end
+        end
+    end
+end)
+
+-- ============================================================
+-- WANTED EVENTS
+-- ============================================================
+
 RegisterNetEvent('flake_wanted:server:setWanted', function(targetId, reason)
     local source = source
-
     if not hasRequiredJob(source) then
-        TriggerClientEvent('flake_wanted:client:notify', source, "You don't have permission to use this command.", "error")
+        TriggerClientEvent('flake_wanted:client:notify', source, "You don't have permission.", "error")
         return
     end
 
     local targetPlayer = tonumber(targetId)
     if not targetPlayer or not GetPlayerEndpoint(targetPlayer) then
-        TriggerClientEvent('flake_wanted:client:notify', source, "Invalid player ID.", "error")
+        TriggerClientEvent('flake_wanted:client:notify', source, "Player not found.", "error")
         return
     end
 
-    local officerName = GetPlayerName(source)
-    local targetName = GetPlayerName(targetPlayer)
+    local officerName             = GetFullName(source)
+    local targetName              = GetFullName(targetPlayer)
+    local firstName, lastName     = GetCharacterName(targetPlayer)
 
-    -- Set player as wanted
     wantedPlayers[targetPlayer] = {
-        reason = reason,
-        officer = officerName,
-        time = os.time()
+        reason    = reason,
+        officer   = officerName,
+        firstName = firstName,
+        lastName  = lastName,
+        time      = os.time()
     }
 
-    -- Request the mugshot from the target player
+    -- Ask target to capture and return their mugshot; the rest of the
+    -- flow continues in flake_wanted:server:receiveMugshot
     TriggerClientEvent('flake_wanted:client:getMugshot', targetPlayer, reason, officerName)
 
-    -- Get first and last name for the UI
-    local firstName, lastName = "Unknown", "Suspect"
-    if QBCore then
-        local Player = QBCore.Functions.GetPlayer(targetPlayer)
-        if Player then
-            firstName = Player.PlayerData.charinfo.firstname
-            lastName = Player.PlayerData.charinfo.lastname
-        end
-    elseif ESX then
-        local xPlayer = ESX.GetPlayerFromId(targetPlayer)
-        if xPlayer then
-            -- ESX might store names differently, adjust as needed
-            local fullName = xPlayer.getName() or "Unknown Suspect"
-            local nameParts = {}
-            for part in fullName:gmatch("%S+") do
-                table.insert(nameParts, part)
-            end
-            if #nameParts >= 2 then
-                firstName = nameParts[1]
-                lastName = nameParts[2]
-            else
-                firstName = fullName
-                lastName = ""
-            end
-        end
-    end
+    ForEachPolice(function(pid)
+        TriggerClientEvent('flake_wanted:client:notify', pid, targetName .. " is now wanted for: " .. reason, "inform")
+    end)
 
-    -- The actual setting of wanted status will be handled by the client's response with the mugshot
-    -- Notify all police immediately
-    for _, playerId in ipairs(GetPlayers()) do
-        if hasRequiredJob(tonumber(playerId)) then
-            TriggerClientEvent('flake_wanted:client:notify', tonumber(playerId), targetName .. " is now wanted for: " .. reason, "inform")
-        end
-    end
-
-    -- Save to database
     SaveRecord(officerName, targetName, reason, "Wanted")
 end)
 
--- Event for removing wanted status
 RegisterNetEvent('flake_wanted:server:removeWanted', function(targetId)
     local source = source
-    local targetPlayer = targetId
+    local targetPlayer
 
     if targetId then
-        -- Admin or police is removing wanted status
+        -- Officer explicitly removing a warrant
         if not hasRequiredJob(source) then
-            TriggerClientEvent('flake_wanted:client:notify', source, "You don't have permission to use this command.", "error")
+            TriggerClientEvent('flake_wanted:client:notify', source, "You don't have permission.", "error")
             return
         end
-
         targetPlayer = tonumber(targetId)
-        if not targetPlayer or not GetPlayerEndpoint(targetPlayer) then
-            TriggerClientEvent('flake_wanted:client:notify', source, "Invalid player ID.", "error")
+        if not targetPlayer then
+            TriggerClientEvent('flake_wanted:client:notify', source, "Invalid player.", "error")
             return
         end
     else
-        -- Player's wanted status expired
+        -- Wanted timer expired on the client; source == the wanted player
         targetPlayer = source
     end
 
     if wantedPlayers[targetPlayer] then
-        local officerName = GetPlayerName(source)
-        local targetName = GetPlayerName(targetPlayer)
+        local officerName = GetFullName(source)
+        local targetName  = GetFullName(targetPlayer)
 
-        -- Remove wanted status
         wantedPlayers[targetPlayer] = nil
 
-        -- Trigger client event for the player
         TriggerClientEvent('flake_wanted:client:removeWanted', targetPlayer)
 
-        -- Notify all police officers to remove the blip
-        for _, playerId in ipairs(GetPlayers()) do
-            if hasRequiredJob(tonumber(playerId)) then
-                TriggerClientEvent('flake_wanted:client:removeWantedBlip', tonumber(playerId))
-            end
-        end
+        ForEachPolice(function(pid)
+            TriggerClientEvent('flake_wanted:client:removeWantedBlip', pid, targetPlayer)
+            TriggerClientEvent('flake_wanted:client:notify', pid, targetName .. " is no longer wanted.", "inform")
+        end)
 
-        -- Save to database if removed by officer
         if targetId then
             SaveRecord(officerName, targetName, "N/A", "Wanted Removed")
         end
-    end
-end)
-
--- Event for updating wanted player blip
-RegisterNetEvent('flake_wanted:server:updateWantedBlip', function(coords)
-    local source = source
-
-    if wantedPlayers[source] then
-        -- Get player name for the blip
-        local firstName, lastName = "Unknown", "Suspect"
-        if QBCore then
-            local Player = QBCore.Functions.GetPlayer(source)
-            if Player and Player.PlayerData and Player.PlayerData.charinfo then
-                firstName = Player.PlayerData.charinfo.firstname
-                lastName = Player.PlayerData.charinfo.lastname
-            end
-        elseif ESX then
-            local xPlayer = ESX.GetPlayerFromId(source)
-            if xPlayer then
-                -- ESX might store names differently, adjust as needed
-                firstName = xPlayer.get('firstName') or "Unknown"
-                lastName = xPlayer.get('lastName') or "Suspect"
-            end
-        end
-
-        -- Broadcast to all police
-        for _, playerId in ipairs(GetPlayers()) do
-            if hasRequiredJob(tonumber(playerId)) then
-                TriggerClientEvent('flake_wanted:client:updateWantedBlip', tonumber(playerId), coords, firstName, lastName)
-            end
+    else
+        if targetId then
+            TriggerClientEvent('flake_wanted:client:notify', source, "That player is not currently wanted.", "error")
         end
     end
 end)
 
--- Event for setting a raid
-RegisterNetEvent('flake_wanted:server:setRaid', function(location, reason)
-    local source = source
+-- Receives the mugshot from the target; finalises the wanted broadcast
+RegisterNetEvent('flake_wanted:server:receiveMugshot', function(reason, officerName, mugshot)
+    local source      = source
+    local targetPlayer = source
+    local firstName, lastName = GetCharacterName(targetPlayer)
 
+    -- Sound + UI for the wanted player themselves
+    PlaySoundOn(targetPlayer, Config.Sounds.wanted, 0.7)
+    TriggerClientEvent('flake_wanted:client:setWanted', targetPlayer, reason, Config.Duration, firstName, lastName, mugshot)
+
+    -- Sound + broadcast UI for all police officers
+    ForEachPolice(function(pid)
+        if pid ~= targetPlayer then
+            PlaySoundOn(pid, Config.Sounds.wanted, 0.5)
+            TriggerClientEvent('flake_wanted:client:showWantedBroadcast', pid, firstName, lastName, reason, mugshot)
+        end
+    end)
+end)
+
+-- ============================================================
+-- JAIL EVENTS
+-- ============================================================
+
+RegisterNetEvent('flake_wanted:server:jailPlayer', function(targetId, time, reason)
+    local source = source
     if not hasRequiredJob(source) then
-        TriggerClientEvent('flake_wanted:client:notify', source, "You don't have permission to use this command.", "error")
+        TriggerClientEvent('flake_wanted:client:notify', source, "You don't have permission.", "error")
         return
     end
 
-    local officerName = GetPlayerName(source)
+    local targetPlayer = tonumber(targetId)
+    if not targetPlayer or not GetPlayerEndpoint(targetPlayer) then
+        TriggerClientEvent('flake_wanted:client:notify', source, "Player not found.", "error")
+        return
+    end
 
-    -- Notify all police
-    for _, playerId in ipairs(GetPlayers()) do
-        if hasRequiredJob(tonumber(playerId)) then
-            TriggerClientEvent('flake_wanted:client:notify', tonumber(playerId), "Raid in progress at " .. location .. ". Reason: " .. reason, "inform")
+    local officerName = GetFullName(source)
+    local targetName  = GetFullName(targetPlayer)
+    local jailMinutes = tonumber(time) or 10
+
+    -- Remove any active warrant for this player
+    if wantedPlayers[targetPlayer] then
+        wantedPlayers[targetPlayer] = nil
+        TriggerClientEvent('flake_wanted:client:removeWanted', targetPlayer)
+        ForEachPolice(function(pid)
+            TriggerClientEvent('flake_wanted:client:removeWantedBlip', pid, targetPlayer)
+        end)
+    end
+
+    -- Jail via tk_jail (server-side export; no job check needed here)
+    exports.tk_jail:jail(tostring(targetPlayer), jailMinutes, 'jail', nil, true, reason)
+
+    -- Ask target to capture mugshot so the announcement can play
+    TriggerClientEvent('flake_wanted:client:getJailMugshot', targetPlayer, jailMinutes, reason, officerName)
+
+    TriggerClientEvent('flake_wanted:client:notify', source, targetName .. " jailed for " .. jailMinutes .. " minutes.", "success")
+
+    LogJailAction(officerName, targetName, jailMinutes, reason)
+    SaveRecord(officerName, targetName, reason, "Jailed for " .. jailMinutes .. " minutes")
+end)
+
+-- Receives mugshot from the jailed player; broadcasts the jail announcement
+RegisterNetEvent('flake_wanted:server:receiveJailMugshot', function(time, reason, officerName, mugshot)
+    local source      = source
+    local targetPlayer = source
+    local firstName, lastName = GetCharacterName(targetPlayer)
+
+    -- Louder sound for the jailed player, softer for everyone else
+    PlaySoundOn(targetPlayer, Config.Sounds.jailed, 0.7)
+
+    for _, pid in ipairs(GetPlayers()) do
+        local playerId = tonumber(pid)
+        if playerId ~= targetPlayer then
+            PlaySoundOn(playerId, Config.Sounds.jailed, 0.3)
         end
+        TriggerClientEvent('flake_wanted:client:showJailAnnouncement', playerId, firstName, lastName, time, reason, mugshot)
+    end
+end)
+
+-- ============================================================
+-- RAID EVENTS
+-- ============================================================
+
+RegisterNetEvent('flake_wanted:server:setRaid', function(location, reason)
+    local source = source
+    if not hasRequiredJob(source) then
+        TriggerClientEvent('flake_wanted:client:notify', source, "You don't have permission.", "error")
+        return
     end
 
-    -- Send UI notification to all players
-    for _, playerId in ipairs(GetPlayers()) do
-        TriggerClientEvent('flake_wanted:client:showRaidUI', tonumber(playerId), location, reason)
+    local officerName = GetFullName(source)
+
+    for _, pid in ipairs(GetPlayers()) do
+        local playerId = tonumber(pid)
+        PlaySoundOn(playerId, Config.Sounds.raid, 0.5)
+        TriggerClientEvent('flake_wanted:client:showRaidUI', playerId, location, reason)
     end
 
-    -- Log the raid
+    ForEachPolice(function(pid)
+        TriggerClientEvent('flake_wanted:client:notify', pid, "Raid in progress at " .. location .. ". Reason: " .. reason, "inform")
+    end)
+
     LogRaidAction(officerName, location, reason)
-
-    -- Save to database
     SaveRecord(officerName, location, reason, "Raid")
 end)
 
--- Event for ending a raid
 RegisterNetEvent('flake_wanted:server:endRaid', function(location)
     local source = source
-
     if not hasRequiredJob(source) then
-        TriggerClientEvent('flake_wanted:client:notify', source, "You don't have permission to use this command.", "error")
+        TriggerClientEvent('flake_wanted:client:notify', source, "You don't have permission.", "error")
         return
     end
 
-    local officerName = GetPlayerName(source)
+    local officerName = GetFullName(source)
 
-    -- Notify all police
-    for _, playerId in ipairs(GetPlayers()) do
-        if hasRequiredJob(tonumber(playerId)) then
-            TriggerClientEvent('flake_wanted:client:notify', tonumber(playerId), "Raid at " .. location .. " has ended.", "inform")
-        end
+    for _, pid in ipairs(GetPlayers()) do
+        TriggerClientEvent('flake_wanted:client:showRaidEndUI', tonumber(pid), location)
     end
 
-    -- Send UI notification to all players
-    for _, playerId in ipairs(GetPlayers()) do
-        TriggerClientEvent('flake_wanted:client:showRaidEndUI', tonumber(playerId), location)
-    end
+    ForEachPolice(function(pid)
+        TriggerClientEvent('flake_wanted:client:notify', pid, "Raid at " .. location .. " has ended.", "inform")
+    end)
 
-    -- Save to database
     SaveRecord(officerName, location, "N/A", "Raid Ended")
 end)
 
--- No longer using raid blips
+-- ============================================================
+-- MISC
+-- ============================================================
 
--- Function to announce jail (exported)
+-- Clean up blips for all police when a wanted player disconnects
+AddEventHandler('playerDropped', function()
+    local source = source
+    if wantedPlayers[source] then
+        wantedPlayers[source] = nil
+        ForEachPolice(function(pid)
+            TriggerClientEvent('flake_wanted:client:removeWantedBlip', pid, source)
+        end)
+    end
+end)
+
+RegisterCommand('wantedlist', function(source, args)
+    if not hasRequiredJob(source) then
+        TriggerClientEvent('flake_wanted:client:notify', source, "You don't have permission.", "error")
+        return
+    end
+
+    local list     = "Current Wanted Players:\n"
+    local hasEntry = false
+
+    for playerId, data in pairs(wantedPlayers) do
+        if GetPlayerEndpoint(playerId) then
+            local elapsed   = os.difftime(os.time(), data.time)
+            local remaining = math.max(0, (Config.Duration * 60) - elapsed)
+            local m         = math.floor(remaining / 60)
+            local s         = math.floor(remaining % 60)
+            list     = list .. data.firstName .. " " .. data.lastName ..
+                       " (ID: " .. playerId .. ") - " .. data.reason ..
+                       " - " .. m .. "m " .. s .. "s\n"
+            hasEntry = true
+        end
+    end
+
+    if not hasEntry then list = "No players are currently wanted." end
+
+    TriggerClientEvent('chat:addMessage', source, {
+        color     = {255, 255, 0},
+        multiline = true,
+        args      = {"WANTED LIST", list}
+    })
+end, false)
+
+RegisterNetEvent('flake_wanted:server:getOnlinePlayers', function()
+    local source  = source
+    local players = {}
+
+    for _, pid in ipairs(GetPlayers()) do
+        local id              = tonumber(pid)
+        local firstName, lastName = GetCharacterName(id)
+        players[#players + 1] = {
+            value = id,
+            label = firstName .. " " .. lastName .. " (ID: " .. id .. ")"
+        }
+    end
+
+    TriggerClientEvent('flake_wanted:client:receiveOnlinePlayers', source, players)
+end)
+
+-- Exported function for external resources (e.g. tk_jail callbacks)
 function AnnounceJail(target, time, reason, officer)
     local targetPlayer = tonumber(target)
     if not targetPlayer or not GetPlayerEndpoint(targetPlayer) then return false end
 
     local officerName = officer or "System"
-    local targetName = GetPlayerName(targetPlayer)
+    local targetName  = GetFullName(targetPlayer)
 
-    -- Trigger client event
-    TriggerClientEvent('flake_wanted:client:jailNotification', targetPlayer, time, reason)
-
-    -- Log the jail
+    exports.tk_jail:jail(tostring(targetPlayer), time, 'jail', nil, true, reason)
+    TriggerClientEvent('flake_wanted:client:getJailMugshot', targetPlayer, time, reason, officerName)
     LogJailAction(officerName, targetName, time, reason)
-
-    -- Save to database
     SaveRecord(officerName, targetName, reason, "Jailed for " .. time .. " minutes")
-
-    -- Announce to all players
-    TriggerClientEvent('chat:addMessage', -1, {
-        color = {255, 0, 0},
-        multiline = true,
-        args = {"JAIL ALERT", targetName .. " has been jailed for " .. time .. " minutes. Reason: " .. reason}
-    })
 
     return true
 end
-
--- Event for client notifications
-RegisterNetEvent('flake_wanted:client:notify', function(message, type)
-    local source = source
-    TriggerClientEvent('flake_wanted:client:notify', source, message, type)
-end)
-
--- Event for announcing a warrant without actually setting a player as wanted
-RegisterNetEvent('flake_wanted:server:announceWarrant', function(firstName, lastName, reason, mugshot)
-    local source = source
-
-    if not hasRequiredJob(source) then
-        TriggerClientEvent('flake_wanted:client:notify', source, "You don't have permission to use this command.", "error")
-        return
-    end
-
-    local officerName = GetPlayerName(source)
-
-    -- Log the announcement
-    LogWantedAction(officerName, firstName .. " " .. lastName, reason, "Warrant Announcement")
-
-    -- Broadcast to all players
-    for _, playerId in ipairs(GetPlayers()) do
-        TriggerClientEvent('flake_wanted:client:showWantedBroadcast', tonumber(playerId), firstName, lastName, reason, mugshot)
-    end
-
-    -- Save to database
-    SaveRecord(officerName, firstName .. " " .. lastName, reason, "Warrant Announcement")
-end)
-
--- Event to receive mugshot from target player and complete the wanted process
-RegisterNetEvent('flake_wanted:server:receiveMugshot', function(reason, officerName, mugshot)
-    local source = source
-    local targetPlayer = source
-    local targetName = GetPlayerName(targetPlayer)
-
-    -- Get first and last name for the UI
-    local firstName, lastName = "Unknown", "Suspect"
-    if QBCore then
-        local Player = QBCore.Functions.GetPlayer(targetPlayer)
-        if Player and Player.PlayerData and Player.PlayerData.charinfo then
-            firstName = Player.PlayerData.charinfo.firstname
-            lastName = Player.PlayerData.charinfo.lastname
-        end
-    elseif ESX then
-        local xPlayer = ESX.GetPlayerFromId(targetPlayer)
-        if xPlayer then
-            -- ESX might store names differently, adjust as needed
-            firstName = xPlayer.get('firstName') or "Unknown"
-            lastName = xPlayer.get('lastName') or "Suspect"
-        end
-    else
-        -- Fallback to splitting player name
-        local fullName = targetName or "Unknown Suspect"
-        local nameParts = {}
-        for part in fullName:gmatch("%S+") do
-            table.insert(nameParts, part)
-        end
-        if #nameParts >= 2 then
-            firstName = nameParts[1]
-            lastName = nameParts[2]
-        else
-            firstName = fullName
-            lastName = ""
-        end
-    end
-
-    -- Trigger client event for the wanted player
-    TriggerClientEvent('flake_wanted:client:setWanted', targetPlayer, reason, Config.Duration, firstName, lastName, mugshot)
-
-    -- Broadcast wanted notification to all players
-    for _, playerId in ipairs(GetPlayers()) do
-        if tonumber(playerId) ~= targetPlayer then -- Don't send to the wanted player (they already got it)
-            TriggerClientEvent('flake_wanted:client:showWantedBroadcast', tonumber(playerId), firstName, lastName, reason, mugshot)
-        end
-    end
-end)
-
--- Event for announcing a jail sentence without actually jailing a player
-RegisterNetEvent('flake_wanted:server:announceJail', function(targetId, time, reason)
-    local source = source
-
-    if not hasRequiredJob(source) then
-        TriggerClientEvent('flake_wanted:client:notify', source, "You don't have permission to use this command.", "error")
-        return
-    end
-
-    local officerName = GetPlayerName(source)
-    local targetPlayer = tonumber(targetId)
-
-    if not targetPlayer or not GetPlayerEndpoint(targetPlayer) then
-        TriggerClientEvent('flake_wanted:client:notify', source, "Invalid player ID.", "error")
-        return
-    end
-
-    local targetName = GetPlayerName(targetPlayer)
-
-    -- Request the mugshot from the target player
-    TriggerClientEvent('flake_wanted:client:getJailMugshot', targetPlayer, time, reason, officerName)
-
-    -- Get first and last name for the UI
-    local firstName, lastName = "Unknown", "Prisoner"
-    if QBCore then
-        local Player = QBCore.Functions.GetPlayer(targetPlayer)
-        if Player then
-            firstName = Player.PlayerData.charinfo.firstname
-            lastName = Player.PlayerData.charinfo.lastname
-        end
-    elseif ESX then
-        local xPlayer = ESX.GetPlayerFromId(targetPlayer)
-        if xPlayer then
-            -- ESX might store names differently, adjust as needed
-            local fullName = xPlayer.getName() or "Unknown Prisoner"
-            local nameParts = {}
-            for part in fullName:gmatch("%S+") do
-                table.insert(nameParts, part)
-            end
-            if #nameParts >= 2 then
-                firstName = nameParts[1]
-                lastName = nameParts[2]
-            else
-                firstName = fullName
-                lastName = ""
-            end
-        end
-    else
-        -- If no framework is detected, use the player name
-        local fullName = targetName or "Unknown Prisoner"
-        local nameParts = {}
-        for part in fullName:gmatch("%S+") do
-            table.insert(nameParts, part)
-        end
-        if #nameParts >= 2 then
-            firstName = nameParts[1]
-            lastName = nameParts[2]
-        else
-            firstName = fullName
-            lastName = ""
-        end
-    end
-
-    -- Log the announcement
-    LogJailAction(officerName, targetName, time, reason)
-
-    -- Save to database
-    SaveRecord(officerName, targetName, reason, "Jail Announcement for " .. time .. " months")
-end)
-
--- Event to receive jail mugshot from target player and complete the jail announcement process
-RegisterNetEvent('flake_wanted:server:receiveJailMugshot', function(time, reason, officerName, mugshot)
-    local source = source
-    local targetPlayer = source
-    local targetName = GetPlayerName(targetPlayer)
-
-    -- Get first and last name for the UI
-    local firstName, lastName = "Unknown", "Prisoner"
-    if QBCore then
-        local Player = QBCore.Functions.GetPlayer(targetPlayer)
-        if Player and Player.PlayerData and Player.PlayerData.charinfo then
-            firstName = Player.PlayerData.charinfo.firstname
-            lastName = Player.PlayerData.charinfo.lastname
-        end
-    elseif ESX then
-        local xPlayer = ESX.GetPlayerFromId(targetPlayer)
-        if xPlayer then
-            -- ESX might store names differently, adjust as needed
-            firstName = xPlayer.get('firstName') or "Unknown"
-            lastName = xPlayer.get('lastName') or "Prisoner"
-        end
-    else
-        -- Fallback to splitting player name
-        local fullName = targetName or "Unknown Prisoner"
-        local nameParts = {}
-        for part in fullName:gmatch("%S+") do
-            table.insert(nameParts, part)
-        end
-        if #nameParts >= 2 then
-            firstName = nameParts[1]
-            lastName = nameParts[2]
-        else
-            firstName = fullName
-            lastName = ""
-        end
-    end
-
-    -- Broadcast to all players
-    for _, playerId in ipairs(GetPlayers()) do
-        TriggerClientEvent('flake_wanted:client:showJailAnnouncement', tonumber(playerId), firstName, lastName, time, reason, mugshot)
-    end
-end)
-
--- Command to check wanted players
-RegisterCommand('wantedlist', function(source, args, rawCommand)
-    if not hasRequiredJob(source) then
-        TriggerClientEvent('flake_wanted:client:notify', source, "You don't have permission to use this command.", "error")
-        return
-    end
-
-    local wantedList = "Current Wanted Players:\n"
-    local hasWanted = false
-
-    for playerId, data in pairs(wantedPlayers) do
-        if GetPlayerEndpoint(playerId) then
-            local playerName = GetPlayerName(playerId)
-            local elapsedTime = os.difftime(os.time(), data.time)
-            local remainingTime = math.max(0, (Config.Duration * 60) - elapsedTime)
-            local minutes = math.floor(remainingTime / 60)
-            local seconds = math.floor(remainingTime % 60)
-
-            wantedList = wantedList .. playerName .. " (ID: " .. playerId .. ") - Reason: " .. data.reason .. " - Time Remaining: " .. minutes .. "m " .. seconds .. "s\n"
-            hasWanted = true
-        end
-    end
-
-    if not hasWanted then
-        wantedList = "No players are currently wanted."
-    end
-
-    TriggerClientEvent('chat:addMessage', source, {
-        color = {255, 255, 0},
-        multiline = true,
-        args = {"WANTED LIST", wantedList}
-    })
-end, false)
-
--- Event to get online players for dropdown selection
-RegisterNetEvent('flake_wanted:server:getOnlinePlayers', function()
-    local source = source
-    local players = {}
-
-    for _, playerId in ipairs(GetPlayers()) do
-        local id = tonumber(playerId)
-        local playerName = GetPlayerName(id)
-
-        -- Get first and last name for better display
-        local firstName, lastName = "Unknown", "Player"
-        if QBCore then
-            local Player = QBCore.Functions.GetPlayer(id)
-            if Player and Player.PlayerData and Player.PlayerData.charinfo then
-                firstName = Player.PlayerData.charinfo.firstname
-                lastName = Player.PlayerData.charinfo.lastname
-                playerName = firstName .. " " .. lastName
-            end
-        elseif ESX then
-            local xPlayer = ESX.GetPlayerFromId(id)
-            if xPlayer then
-                -- ESX might store names differently, adjust as needed
-                local fullName = xPlayer.getName() or playerName
-                local nameParts = {}
-                for part in fullName:gmatch("%S+") do
-                    table.insert(nameParts, part)
-                end
-                if #nameParts >= 2 then
-                    firstName = nameParts[1]
-                    lastName = nameParts[2]
-                    playerName = firstName .. " " .. lastName
-                end
-            end
-        end
-
-        table.insert(players, {
-            value = id,
-            label = playerName .. " (ID: " .. id .. ")"
-        })
-    end
-
-    TriggerClientEvent('flake_wanted:client:receiveOnlinePlayers', source, players)
-end)
