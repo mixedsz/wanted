@@ -57,10 +57,6 @@ local function ForEachPolice(cb)
     end
 end
 
-local function PlaySoundOn(targetId, sound, volume)
-    TriggerClientEvent('InteractSound_CL:PlayOnOne', targetId, sound, volume)
-end
-
 -- ============================================================
 -- DATABASE
 -- ============================================================
@@ -206,14 +202,10 @@ RegisterNetEvent('flake_wanted:server:receiveMugshot', function(reason, officerN
     local targetPlayer = source
     local firstName, lastName = GetCharacterName(targetPlayer)
 
-    -- Sound + UI for the wanted player themselves
-    PlaySoundOn(targetPlayer, Config.Sounds.wanted, 0.7)
     TriggerClientEvent('flake_wanted:client:setWanted', targetPlayer, reason, Config.Duration, firstName, lastName, mugshot)
 
-    -- Sound + broadcast UI for all police officers
     ForEachPolice(function(pid)
         if pid ~= targetPlayer then
-            PlaySoundOn(pid, Config.Sounds.wanted, 0.5)
             TriggerClientEvent('flake_wanted:client:showWantedBroadcast', pid, firstName, lastName, reason, mugshot)
         end
     end)
@@ -267,15 +259,8 @@ RegisterNetEvent('flake_wanted:server:receiveJailMugshot', function(time, reason
     local targetPlayer = source
     local firstName, lastName = GetCharacterName(targetPlayer)
 
-    -- Louder sound for the jailed player, softer for everyone else
-    PlaySoundOn(targetPlayer, Config.Sounds.jailed, 0.7)
-
     for _, pid in ipairs(GetPlayers()) do
-        local playerId = tonumber(pid)
-        if playerId ~= targetPlayer then
-            PlaySoundOn(playerId, Config.Sounds.jailed, 0.3)
-        end
-        TriggerClientEvent('flake_wanted:client:showJailAnnouncement', playerId, firstName, lastName, time, reason, mugshot)
+        TriggerClientEvent('flake_wanted:client:showJailAnnouncement', tonumber(pid), firstName, lastName, time, reason, mugshot)
     end
 end)
 
@@ -293,9 +278,7 @@ RegisterNetEvent('flake_wanted:server:setRaid', function(location, reason)
     local officerName = GetFullName(source)
 
     for _, pid in ipairs(GetPlayers()) do
-        local playerId = tonumber(pid)
-        PlaySoundOn(playerId, Config.Sounds.raid, 0.5)
-        TriggerClientEvent('flake_wanted:client:showRaidUI', playerId, location, reason)
+        TriggerClientEvent('flake_wanted:client:showRaidUI', tonumber(pid), location, reason)
     end
 
     ForEachPolice(function(pid)
